@@ -69,6 +69,17 @@ type Config struct {
 	OidcUseCookie             bool   `koanf:"oidc-use-cookie"`
 	OidcSkipTLSVerify         bool   `koanf:"oidc-skip-tls-verify"`
 	OidcCAFile                string `koanf:"oidc-ca-file"`
+	// OidcAPIProxy is the URL of an external Kubernetes API proxy through
+	// which all Kubernetes API requests are routed instead of the
+	// kube-apiserver directly. The OIDC bearer token is forwarded as-is
+	// in the Authorization header.
+	OidcAPIProxy string `koanf:"oidc-api-proxy"`
+	// OidcAPIProxyCAFile is the path to a PEM-encoded CA bundle used to
+	// verify the TLS certificate of the api-proxy. Optional.
+	OidcAPIProxyCAFile string `koanf:"oidc-api-proxy-ca-file"`
+	// OidcAPIProxySkipTLSVerify disables TLS verification for the api-proxy
+	// connection. Use only for testing.
+	OidcAPIProxySkipTLSVerify bool   `koanf:"oidc-api-proxy-skip-tls-verify"`
 	MeUsernamePath            string `koanf:"me-username-path"`
 	MeEmailPath               string `koanf:"me-email-path"`
 	MeGroupsPath              string `koanf:"me-groups-path"`
@@ -87,6 +98,28 @@ type Config struct {
 	// TLS config
 	TLSCertPath string `koanf:"tls-cert-path"`
 	TLSKeyPath  string `koanf:"tls-key-path"`
+}
+
+// validateAPIProxy validates the oidc-api-proxy-* configuration options.
+func (c *Config) validateAPIProxy() error {
+	if c.OidcAPIProxyCAFile != "" {
+		caFileContents, err := os.ReadFile(c.OidcAPIProxyCAFile)
+		if err != nil {
+			return fmt.Errorf("error reading oidc-api-proxy-ca-file: %w", err)
+		}
+
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caFileContents) {
+			return errors.New("invalid oidc-api-proxy-ca-file")
+		}
+	}
+
+	if c.OidcAPIProxySkipTLSVerify {
+		logger.Log(logger.LevelWarn, nil, nil,
+			"oidc-api-proxy-skip-tls-verify is set, this is not safe for production")
+	}
+
+	return nil
 }
 
 func (c *Config) Validate() error {
@@ -114,6 +147,10 @@ func (c *Config) Validate() error {
 		if !caCertPool.AppendCertsFromPEM(caFileContents) {
 			return errors.New("invalid oidc-ca-file")
 		}
+	}
+
+	if err := c.validateAPIProxy(); err != nil {
+		return err
 	}
 
 	if c.BaseURL != "" && !strings.HasPrefix(c.BaseURL, "/") {
@@ -465,6 +502,14 @@ func addOIDCFlags(f *flag.FlagSet) {
 	f.String("oidc-scopes", "profile,email", "A comma separated list of scopes needed from the OIDC provider")
 	f.Bool("oidc-skip-tls-verify", false, "Skip TLS verification for OIDC")
 	f.String("oidc-ca-file", "", "CA file for OIDC")
+	f.String("oidc-api-proxy", "",
+		"URL of an external Kubernetes API proxy. When set, "+
+			"all Kubernetes API requests are routed through this URL instead of "+
+			"the kube-apiserver. The OIDC bearer token is forwarded as-is.")
+	f.String("oidc-api-proxy-ca-file", "",
+		"PEM-encoded CA file used to verify the TLS certificate of the api-proxy")
+	f.Bool("oidc-api-proxy-skip-tls-verify", false,
+		"Skip TLS verification for the api-proxy connection (testing only)")
 	f.Bool("oidc-use-access-token", false, "Setup oidc to pass through the access_token instead of the default id_token")
 	f.Bool("oidc-use-cookie", false, "Enable OIDC cookie usage even when not running in-cluster")
 	f.Bool("oidc-use-pkce", false, "Use PKCE (Proof Key for Code Exchange) for enhanced security in OIDC flow")

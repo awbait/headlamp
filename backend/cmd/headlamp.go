@@ -457,7 +457,10 @@ func createHeadlampHandler(ctx context.Context, config *HeadlampConfig) http.Han
 			config.OidcClientID, config.OidcClientSecret,
 			strings.Join(config.OidcScopes, ","),
 			config.OidcSkipTLSVerify,
-			config.OidcCACert)
+			config.OidcCACert,
+			config.OidcAPIProxy,
+			config.OidcAPIProxyCACert,
+			config.OidcAPIProxySkipTLSVerify)
 		if err != nil {
 			logger.Log(logger.LevelError, nil, err, "Failed to get in-cluster context")
 		}
@@ -1544,6 +1547,26 @@ func clusterRequestHandler(c *HeadlampConfig) http.Handler { //nolint:funlen
 		if err != nil {
 			c.handleError(w, ctx, span, err, "failed to parse cluster URL", http.StatusNotFound)
 			return
+		}
+
+		// If the OIDC config defines an external api-proxy,
+		// route the request through that proxy instead of the kube-apiserver.
+		// SetupProxy() already targets the proxy URL; here we only need to
+		// override Host/Scheme so the rewritten request hits the proxy. The
+		// proxy URL's path prefix (if any) is appended automatically by the
+		// reverse-proxy Director (singleJoiningSlash). The OIDC bearer token
+		// from the cookie is forwarded in the Authorization header to
+		// authenticate against the proxy.
+		if kContext.OidcConf != nil && strings.TrimSpace(kContext.OidcConf.APIProxy) != "" {
+			proxyURL, perr := url.Parse(kContext.OidcConf.APIProxy)
+			if perr != nil {
+				c.handleError(w, ctx, span, perr, "failed to parse api-proxy URL", http.StatusInternalServerError)
+				return
+			}
+
+			clusterURL = proxyURL
+
+			span.SetAttributes(attribute.String("cluster.api_proxy", kContext.OidcConf.APIProxy))
 		}
 
 		// Record attributes about the proxy request
