@@ -150,17 +150,10 @@ type stubResolverImpl struct{ allowed map[string]struct{} }
 
 func stubResolver(allowed map[string]struct{}) *Resolver {
 	r := &Resolver{
-		cfg:     Config{UserLabel: DefaultUserLabel, ProjectLabel: DefaultProjectLabel},
-		pmIndex: map[string]map[string]struct{}{},
+		cfg:     Config{ProjectLabel: DefaultProjectLabel},
 		started: true,
 		stopCh:  make(chan struct{}),
 	}
-	// Pre-fill index so AllowedNamespaces returns a project set; we wire the
-	// ns lister by overriding at call-time via a closure-based shim is
-	// awkward, so instead we use the simpler stub by making the test inject
-	// directly through unexported fields. For now we expose the result via a
-	// dedicated stub method by replacing AllowedNamespaces in a sibling test
-	// file.
 	r.testAllowed = allowed
 	return r
 }

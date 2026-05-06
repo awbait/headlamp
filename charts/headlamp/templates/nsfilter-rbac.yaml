@@ -7,9 +7,6 @@ metadata:
     {{- include "headlamp.labels" . | nindent 4 }}
     app.kubernetes.io/component: ns-filter
 rules:
-  - apiGroups: ["auth.alauda.io"]
-    resources: ["projectmembers"]
-    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]

@@ -141,7 +141,6 @@ func createHeadlampConfig(conf *config.Config) *HeadlampConfig {
 		OidcAPIProxy:              conf.OidcAPIProxy,
 		OidcAPIProxySkipTLSVerify: conf.OidcAPIProxySkipTLSVerify,
 		NsFilterEnabled:           conf.NsFilterEnabled,
-		NsFilterUserLabel:         conf.NsFilterUserLabel,
 		NsFilterProjectLabel:      conf.NsFilterProjectLabel,
 		NsFilterProbeVerb:         conf.NsFilterProbeVerb,
 		NsFilterProbeResource:     conf.NsFilterProbeResource,

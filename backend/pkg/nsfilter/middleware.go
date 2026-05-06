@@ -6,9 +6,11 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -66,6 +68,13 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 			apiPath := mux.Vars(r)["api"]
 			kind, nsName := classify(apiPath)
 
+			logger.Log(logger.LevelInfo, map[string]string{
+				"path":   apiPath,
+				"kind":   nsKindName(kind),
+				"nsName": nsName,
+				"method": r.Method,
+			}, nil, "nsfilter: classify")
+
 			if kind == nsRequestNone {
 				next.ServeHTTP(w, r)
 				return
@@ -79,9 +88,16 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 				return
 			}
 
+			logger.Log(logger.LevelInfo, map[string]string{
+				"username": username,
+				"path":     apiPath,
+			}, nil, "nsfilter: extracted username")
+
 			if username == "" {
 				// Unauthenticated request -- let the cluster auth layer reject
 				// it; nothing for us to filter.
+				logger.Log(logger.LevelWarn, map[string]string{"path": apiPath}, nil,
+					"nsfilter: empty username, passing through (no filtering)")
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -95,12 +111,26 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 				return
 			}
 
+			logger.Log(logger.LevelInfo, map[string]string{
+				"user":            username,
+				"candidates":      mapKeysJoined(allowed),
+				"candidatesCount": fmt.Sprintf("%d", len(allowed)),
+			}, nil, "nsfilter: candidate set built")
+
 			// Narrow the project-level candidate set down to namespaces the
 			// user actually has the probe permission in, mirroring what Alauda
 			// UI shows. SSAR runs through the upstream Kubernetes API under
 			// the user's bearer token, so the answer reflects real RBAC.
 			if opts.Prober != nil && len(allowed) > 0 {
 				idToken, terr := tokenFromCookie(r)
+
+				logger.Log(logger.LevelInfo, map[string]string{
+					"user":         username,
+					"hasToken":     fmt.Sprintf("%t", idToken != ""),
+					"tokenErr":     fmt.Sprintf("%v", terr),
+					"proberConfig": "enabled",
+				}, nil, "nsfilter: prober available, attempting narrow")
+
 				if terr == nil && idToken != "" {
 					narrowed, perr := opts.Prober.Narrow(r.Context(),
 						MD5Hex(username), idToken, allowed)
@@ -113,8 +143,25 @@ func Middleware(opts MiddlewareOptions) func(http.Handler) http.Handler {
 						return
 					}
 
+					logger.Log(logger.LevelInfo, map[string]string{
+						"user":          username,
+						"before":        fmt.Sprintf("%d", len(allowed)),
+						"after":         fmt.Sprintf("%d", len(narrowed)),
+						"narrowedNames": mapKeysJoined(narrowed),
+					}, nil, "nsfilter: SSAR narrow succeeded")
+
 					allowed = narrowed
+				} else {
+					logger.Log(logger.LevelWarn, map[string]string{
+						"user": username,
+					}, terr, "nsfilter: prober available but no id_token in cookie -- using unnarrowed candidate set (will leak!)")
 				}
+			} else {
+				logger.Log(logger.LevelWarn, map[string]string{
+					"user":           username,
+					"proberNil":      fmt.Sprintf("%t", opts.Prober == nil),
+					"candidatesZero": fmt.Sprintf("%t", len(allowed) == 0),
+				}, nil, "nsfilter: prober NOT applied")
 			}
 
 			// Strip Accept-Encoding so upstream returns plain JSON we can
@@ -195,6 +242,28 @@ func isWatch(r *http.Request) bool {
 	}
 
 	return false
+}
+
+// nsKindName returns a human-readable label for a classification result.
+func nsKindName(k int) string {
+	switch k {
+	case nsRequestList:
+		return "list"
+	case nsRequestSingle:
+		return "single"
+	default:
+		return "none"
+	}
+}
+
+// mapKeysJoined returns a deterministic comma-joined list of map keys for logging.
+func mapKeysJoined(m map[string]struct{}) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 func writeStatus(w http.ResponseWriter, code int, msg string) {

@@ -1159,8 +1159,16 @@ func StartHeadlampServer(config *HeadlampConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	logger.Log(logger.LevelInfo, map[string]string{
+		"NsFilterEnabled":      fmt.Sprintf("%t", config.NsFilterEnabled),
+		"NsFilterProjectLabel": config.NsFilterProjectLabel,
+		"OidcAPIProxy":         config.OidcAPIProxy,
+	}, nil, "ns-filter: config check")
+
 	if config.NsFilterEnabled {
 		setupNsFilter(ctx, config)
+	} else {
+		logger.Log(logger.LevelWarn, nil, nil, "ns-filter: NOT enabled (set --ns-filter-enabled or HEADLAMP_CONFIG_NS_FILTER_ENABLED=true)")
 	}
 
 	handler := createHeadlampHandler(ctx, config)
@@ -1202,7 +1210,6 @@ func setupNsFilter(ctx context.Context, config *HeadlampConfig) {
 	}
 
 	resolver, err := nsfilter.NewResolver(rc, nsfilter.Config{
-		UserLabel:    config.NsFilterUserLabel,
 		ProjectLabel: config.NsFilterProjectLabel,
 	})
 	if err != nil {
@@ -1249,7 +1256,6 @@ func setupNsFilter(ctx context.Context, config *HeadlampConfig) {
 	})
 
 	logger.Log(logger.LevelInfo, map[string]string{
-		"user_label":    config.NsFilterUserLabel,
 		"project_label": config.NsFilterProjectLabel,
 	}, nil, "ns-filter: enabled")
 }

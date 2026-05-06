@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -142,10 +143,21 @@ func (p *Prober) Narrow(ctx context.Context, userHash, idToken string,
 
 			ok, perr := p.canAccess(ctx, idToken, ns)
 			if perr != nil {
-				logger.Log(logger.LevelError, map[string]string{"namespace": ns}, perr,
-					"nsfilter: SSAR probe failed (treating as denied)")
+				logger.Log(logger.LevelError, map[string]string{
+					"namespace": ns,
+					"verb":      p.verb,
+					"resource":  p.resource,
+					"apiGroup":  p.apiGroup,
+				}, perr, "nsfilter: SSAR probe failed (treating as denied)")
 				return
 			}
+
+			logger.Log(logger.LevelInfo, map[string]string{
+				"namespace": ns,
+				"allowed":   fmt.Sprintf("%t", ok),
+				"verb":      p.verb,
+				"resource":  p.resource,
+			}, nil, "nsfilter: SSAR probe result")
 
 			if ok {
 				mu.Lock()
@@ -200,7 +212,15 @@ func (p *Prober) canAccess(ctx context.Context, idToken, namespace string) (bool
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, fmt.Errorf("upstream status %d", resp.StatusCode)
+		// Read body for diagnostics
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		logger.Log(logger.LevelError, map[string]string{
+			"namespace": namespace,
+			"status":    fmt.Sprintf("%d", resp.StatusCode),
+			"body":      string(bodyBytes),
+			"url":       p.upstream + "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+		}, nil, "nsfilter: SSAR upstream error")
+		return false, fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
 	var ssar struct {
