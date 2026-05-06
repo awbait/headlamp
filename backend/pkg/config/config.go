@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/knadh/koanf"
 	"github.com/knadh/koanf/providers/basicflag"
@@ -79,7 +80,27 @@ type Config struct {
 	OidcAPIProxyCAFile string `koanf:"oidc-api-proxy-ca-file"`
 	// OidcAPIProxySkipTLSVerify disables TLS verification for the api-proxy
 	// connection. Use only for testing.
-	OidcAPIProxySkipTLSVerify bool   `koanf:"oidc-api-proxy-skip-tls-verify"`
+	OidcAPIProxySkipTLSVerify bool `koanf:"oidc-api-proxy-skip-tls-verify"`
+	// NsFilterEnabled enables server-side filtering of /api/v1/namespaces*
+	// responses according to Alauda Project membership. The Headlamp
+	// ServiceAccount must have read+watch permissions on
+	// auth.alauda.io/projectmembers and on namespaces (cluster-wide).
+	NsFilterEnabled bool `koanf:"ns-filter-enabled"`
+	// NsFilterProjectLabel is the label key on Namespace that marks it as
+	// a candidate for filtering. Defaults to cpaas.io/project. Namespaces
+	// without this label are never visible through the filter.
+	NsFilterProjectLabel string `koanf:"ns-filter-project-label"`
+	// NsFilterProbeVerb / Resource / APIGroup configure the
+	// SelfSubjectAccessReview that narrows the project candidate set down to
+	// namespaces the user has actual RBAC access in.
+	NsFilterProbeVerb     string `koanf:"ns-filter-probe-verb"`
+	NsFilterProbeResource string `koanf:"ns-filter-probe-resource"`
+	NsFilterProbeAPIGroup string `koanf:"ns-filter-probe-api-group"`
+	// NsFilterProbeConcurrency caps simultaneous SSAR calls per request.
+	NsFilterProbeConcurrency int `koanf:"ns-filter-probe-concurrency"`
+	// NsFilterCacheTTL controls how long Narrow() results are cached per
+	// (user, candidate-set).
+	NsFilterCacheTTL time.Duration `koanf:"ns-filter-cache-ttl"`
 	MeUsernamePath            string `koanf:"me-username-path"`
 	MeEmailPath               string `koanf:"me-email-path"`
 	MeGroupsPath              string `koanf:"me-groups-path"`
@@ -510,6 +531,25 @@ func addOIDCFlags(f *flag.FlagSet) {
 		"PEM-encoded CA file used to verify the TLS certificate of the api-proxy")
 	f.Bool("oidc-api-proxy-skip-tls-verify", false,
 		"Skip TLS verification for the api-proxy connection (testing only)")
+	f.Bool("ns-filter-enabled", false,
+		"Enable server-side namespace filtering. Candidate set is built from "+
+			"namespaces labelled with --ns-filter-project-label and is then "+
+			"narrowed per-user via SelfSubjectAccessReview through "+
+			"--oidc-api-proxy under the user's bearer token. Requires the "+
+			"Headlamp ServiceAccount to have get/list/watch on core/namespaces.")
+	f.String("ns-filter-project-label", "cpaas.io/project",
+		"Label key on Namespace that marks it as a candidate for filtering. "+
+			"Namespaces without this label are never visible through the filter.")
+	f.String("ns-filter-probe-verb", "get",
+		"SSAR probe verb used to narrow Project membership to namespaces the user can really access.")
+	f.String("ns-filter-probe-resource", "pods",
+		"SSAR probe resource used to narrow Project membership to namespaces the user can really access.")
+	f.String("ns-filter-probe-api-group", "",
+		"SSAR probe apiGroup (empty = core).")
+	f.Int("ns-filter-probe-concurrency", 8,
+		"Maximum number of SSAR probes issued in parallel for a single request.")
+	f.Duration("ns-filter-cache-ttl", 60*time.Second,
+		"How long the per-user narrowed namespace set is cached.")
 	f.Bool("oidc-use-access-token", false, "Setup oidc to pass through the access_token instead of the default id_token")
 	f.Bool("oidc-use-cookie", false, "Enable OIDC cookie usage even when not running in-cluster")
 	f.Bool("oidc-use-pkce", false, "Use PKCE (Proof Key for Code Exchange) for enhanced security in OIDC flow")

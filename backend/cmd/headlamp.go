@@ -55,6 +55,7 @@ import (
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/helm"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/nsfilter"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/plugins"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/portforward"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/spa"
@@ -67,6 +68,7 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 
@@ -1157,6 +1159,10 @@ func StartHeadlampServer(config *HeadlampConfig) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	if config.NsFilterEnabled {
+		setupNsFilter(ctx, config)
+	}
+
 	handler := createHeadlampHandler(ctx, config)
 	handler = config.OIDCTokenRefreshMiddleware(handler)
 
@@ -1179,6 +1185,93 @@ func StartHeadlampServer(config *HeadlampConfig) {
 		logger.Log(logger.LevelError, nil, err, "Failed to start server")
 		HandleServerStartError(&err)
 	}
+}
+
+// setupNsFilter wires the Alauda-based namespace filter into the cluster API
+// pipeline. It builds an in-cluster (or fallback kubeconfig) Kubernetes client,
+// starts the informer-backed resolver, and stores the resulting middleware on
+// the HeadlampConfig. On any failure the filter stays disabled and the server
+// continues to serve unfiltered responses (we log loudly so the operator
+// notices); fail-closed semantics (refuse listings) are enforced inside the
+// middleware itself once a request arrives.
+func setupNsFilter(ctx context.Context, config *HeadlampConfig) {
+	rc, err := buildNsFilterRestConfig(config)
+	if err != nil {
+		logger.Log(logger.LevelError, nil, err, "ns-filter: build rest.Config (filter disabled)")
+		return
+	}
+
+	resolver, err := nsfilter.NewResolver(rc, nsfilter.Config{
+		UserLabel:    config.NsFilterUserLabel,
+		ProjectLabel: config.NsFilterProjectLabel,
+	})
+	if err != nil {
+		logger.Log(logger.LevelError, nil, err, "ns-filter: build resolver (filter disabled)")
+		return
+	}
+
+	if err := resolver.Start(ctx); err != nil {
+		logger.Log(logger.LevelError, nil, err, "ns-filter: start informers (filter disabled)")
+		return
+	}
+
+	// Build the SSAR prober. It calls SelfSubjectAccessReview through the
+	// configured api-proxy under the user's bearer token, so its result
+	// matches the cluster's real RBAC (and therefore Alauda UI behaviour).
+	var prober *nsfilter.Prober
+
+	if strings.TrimSpace(config.OidcAPIProxy) != "" {
+		var perr error
+		prober, perr = nsfilter.NewProber(nsfilter.ProberConfig{
+			Upstream:      config.OidcAPIProxy,
+			SkipTLSVerify: config.OidcAPIProxySkipTLSVerify,
+			Verb:          config.NsFilterProbeVerb,
+			Resource:      config.NsFilterProbeResource,
+			APIGroup:      config.NsFilterProbeAPIGroup,
+			Concurrency:   int64(config.NsFilterProbeConcurrency),
+			CacheTTL:      config.NsFilterCacheTTL,
+		})
+		if perr != nil {
+			logger.Log(logger.LevelError, nil, perr,
+				"ns-filter: build prober (project-only filtering)")
+			prober = nil
+		}
+	} else {
+		logger.Log(logger.LevelWarn, nil, nil,
+			"ns-filter: oidc-api-proxy not set; SSAR narrowing disabled (project-only filtering)")
+	}
+
+	config.NsFilterMiddleware = nsfilter.Middleware(nsfilter.MiddlewareOptions{
+		Enabled:         true,
+		Resolver:        resolver,
+		Prober:          prober,
+		ExtractUsername: nsfilter.JWTUsernameExtractor(config.MeUsernamePaths),
+	})
+
+	logger.Log(logger.LevelInfo, map[string]string{
+		"user_label":    config.NsFilterUserLabel,
+		"project_label": config.NsFilterProjectLabel,
+	}, nil, "ns-filter: enabled")
+}
+
+// buildNsFilterRestConfig returns a *rest.Config for the resolver's Kubernetes
+// clients. Preference order:
+//   1. in-cluster config (when running inside the cluster), since the
+//      Headlamp pod's ServiceAccount is the identity that needs RBAC.
+//   2. the kubeconfig pointed at by config.KubeConfigPath (developer mode).
+func buildNsFilterRestConfig(config *HeadlampConfig) (*rest.Config, error) {
+	if config.UseInCluster {
+		return rest.InClusterConfig()
+	}
+
+	loader := clientcmd.NewDefaultClientConfigLoadingRules()
+	if config.KubeConfigPath != "" {
+		loader.ExplicitPath = config.KubeConfigPath
+	}
+
+	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loader, &clientcmd.ConfigOverrides{},
+	).ClientConfig()
 }
 
 // initTelemetry initializes telemetry and metrics for the server.
@@ -1624,6 +1717,10 @@ func handleClusterAPI(c *HeadlampConfig, router *mux.Router) {
 	handler := clusterRequestHandler(c)
 	if c.CacheEnabled {
 		handler = CacheMiddleWare(c)(handler)
+	}
+
+	if c.NsFilterMiddleware != nil {
+		handler = c.NsFilterMiddleware(handler)
 	}
 
 	router.PathPrefix("/clusters/{clusterName}/{api:.*}").Handler(handler)

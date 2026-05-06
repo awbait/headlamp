@@ -145,6 +145,14 @@ clusterRoleBinding:
   # -- Annotations to add to the cluster role binding
   annotations: {}
 
+# -- Server-side namespace filter based on Alauda Project membership.
+# When create=true, an additional read-only ClusterRole + binding is provisioned
+# for the Headlamp ServiceAccount, allowing it to watch ProjectMember CRDs and
+# Namespaces. To enable filtering at runtime, also set
+# config.nsFilter.enabled=true (or HEADLAMP_CONFIG_NS_FILTER_ENABLED=true via env).
+nsFilter:
+  create: false
+
 # -- Annotations to add to the deployment
 deploymentAnnotations: {}
 

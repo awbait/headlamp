@@ -1,0 +1,32 @@
+﻿{{- if .Values.nsFilter.create -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "headlamp.fullname" . }}-ns-filter
+  labels:
+    {{- include "headlamp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ns-filter
+rules:
+  - apiGroups: ["auth.alauda.io"]
+    resources: ["projectmembers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "headlamp.fullname" . }}-ns-filter
+  labels:
+    {{- include "headlamp.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ns-filter
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "headlamp.fullname" . }}-ns-filter
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "headlamp.serviceAccountName" . }}
+    namespace: {{ include "headlamp.namespace" . }}
+{{- end }}

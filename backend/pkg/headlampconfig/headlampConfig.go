@@ -2,6 +2,7 @@ package headlampconfig
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
@@ -36,6 +37,17 @@ type HeadlampConfig struct {
 	OidcAPIProxyCACert string
 	// OidcAPIProxySkipTLSVerify disables TLS verification for the api-proxy.
 	OidcAPIProxySkipTLSVerify bool
+	NsFilterEnabled           bool
+	NsFilterProjectLabel      string
+	NsFilterProbeVerb         string
+	NsFilterProbeResource     string
+	NsFilterProbeAPIGroup     string
+	NsFilterProbeConcurrency  int
+	NsFilterCacheTTL          time.Duration
+	// NsFilterMiddleware, when non-nil, wraps cluster API handlers to
+	// transparently filter /api/v1/namespaces* responses for the
+	// authenticated user. Populated lazily at server startup.
+	NsFilterMiddleware func(http.Handler) http.Handler
 	OidcUsePKCE               bool
 	OidcScopes                []string
 	Cache                     cache.Cache[interface{}]
