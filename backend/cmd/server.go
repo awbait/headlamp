@@ -266,6 +266,8 @@ func createHeadlampConfig(conf *config.Config) *HeadlampConfig {
 
 	if conf.RequireNamespaceGet {
 		headlampConfig.namespaceFilter = newNamespaceFilter()
+		headlampConfig.namespaceProbe = newNamespaceProbeFactory(conf)
+		logNamespaceAccessCheck(conf)
 		multiplexer.SetNamespaceEventFilter(headlampConfig.namespaceEventFilter)
 	}
 
@@ -435,4 +437,21 @@ func runListPlugins() {
 	if err := plugins.ListPlugins(conf.StaticDir, conf.UserPluginsDir, conf.PluginsDir); err != nil {
 		logger.Log(logger.LevelError, nil, err, "listing plugins")
 	}
+}
+
+// logNamespaceAccessCheck logs how require-namespace-get checks namespace
+// access, so operators can tell the modes apart.
+func logNamespaceAccessCheck(conf *config.Config) {
+	fields := map[string]string{"check": config.NamespaceAccessCheckGet}
+
+	if conf.NamespaceAccessCheck == config.NamespaceAccessCheckSSAR {
+		fields = map[string]string{
+			"check":    config.NamespaceAccessCheckSSAR,
+			"verb":     conf.NamespaceAccessSSARVerb,
+			"group":    conf.NamespaceAccessSSARGroup,
+			"resource": conf.NamespaceAccessSSARResource,
+		}
+	}
+
+	logger.Log(logger.LevelInfo, fields, nil, "require-namespace-get is enabled")
 }

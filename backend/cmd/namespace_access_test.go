@@ -15,11 +15,13 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/headlampconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/telemetry"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
@@ -37,6 +39,12 @@ type nsAccessUpstream struct {
 	probeAuth   []string
 	// watchEvents are sent (base64 encoded) to namespace watch clients.
 	watchEvents []string
+	// ssarAllowed answers SelfSubjectAccessReviews per namespace; ssarStatus,
+	// when set, replaces the answer with that HTTP status.
+	ssarAllowed map[string]bool
+	ssarStatus  int
+	ssarAuth    []string
+	ssarReviews []authorizationv1.ResourceAttributes
 }
 
 func (u *nsAccessUpstream) handler(t *testing.T) http.HandlerFunc {
@@ -44,6 +52,8 @@ func (u *nsAccessUpstream) handler(t *testing.T) http.HandlerFunc {
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodPost && r.URL.Path == selfSubjectAccessReviewAPIPath:
+			u.serveSSAR(t, w, r)
 		case r.URL.Path == namespaceListAPIPath && r.URL.Query().Get("watch") != "":
 			u.serveWatch(w, r)
 		case r.URL.Path == namespaceListAPIPath:
@@ -62,6 +72,35 @@ func (u *nsAccessUpstream) handler(t *testing.T) http.HandlerFunc {
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}
+}
+
+func (u *nsAccessUpstream) serveSSAR(t *testing.T, w http.ResponseWriter, r *http.Request) {
+	t.Helper()
+
+	var review authorizationv1.SelfSubjectAccessReview
+	if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&review)) ||
+		!assert.NotNil(t, review.Spec.ResourceAttributes) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	attrs := *review.Spec.ResourceAttributes
+
+	u.mu.Lock()
+	u.ssarAuth = append(u.ssarAuth, r.Header.Get("Authorization"))
+	u.ssarReviews = append(u.ssarReviews, attrs)
+	status := u.ssarStatus
+	review.Status.Allowed = u.ssarAllowed[attrs.Namespace]
+	u.mu.Unlock()
+
+	if status != 0 {
+		w.WriteHeader(status)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(review)
 }
 
 func (u *nsAccessUpstream) serveWatch(w http.ResponseWriter, r *http.Request) {
@@ -354,4 +393,119 @@ func TestMultiplexerForwardNamespaceEvent(t *testing.T) {
 
 	unknownConn := &Connection{ClusterID: "missing", Path: namespaceListAPIPath, Token: &token}
 	assert.False(t, m.forwardNamespaceEvent(unknownConn, visible), "unknown contexts fail closed")
+}
+
+// newSSARNamespaceAccessTestConfig is newNamespaceAccessTestConfig with
+// namespace-access-check=ssar for the given verb and resource.
+func newSSARNamespaceAccessTestConfig(t *testing.T, upstreamURL, verb, resource string) *HeadlampConfig {
+	t.Helper()
+
+	c := newNamespaceAccessTestConfig(t, upstreamURL)
+	c.namespaceProbe = newNamespaceProbeFactory(&config.Config{
+		NamespaceAccessCheck:        config.NamespaceAccessCheckSSAR,
+		NamespaceAccessSSARVerb:     verb,
+		NamespaceAccessSSARResource: resource,
+	})
+
+	return c
+}
+
+func serveNamespaceList(t *testing.T, c *HeadlampConfig) *httptest.ResponseRecorder {
+	t.Helper()
+
+	router := mux.NewRouter()
+	handleClusterAPI(c, router)
+
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet,
+		"/clusters/"+nsAccessCluster+namespaceListAPIPath, nil)
+	req.AddCookie(nsAccessCookie())
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	return rr
+}
+
+// TestNamespaceAccessSSARFiltersList checks that with
+// namespace-access-check=ssar the listing is filtered by
+// SelfSubjectAccessReviews for the configured verb and resource, sent with the
+// user's token, and that a cluster-wide "get namespaces" (every GET answering
+// 200) does not make hidden namespaces visible.
+func TestNamespaceAccessSSARFiltersList(t *testing.T) {
+	upstream := &nsAccessUpstream{
+		getStatuses: map[string]int{"visible": 200, "hidden": 200, "gone": 200},
+		ssarAllowed: map[string]bool{"visible": true},
+	}
+	server := httptest.NewTLSServer(upstream.handler(t))
+	t.Cleanup(server.Close)
+
+	rr := serveNamespaceList(t, newSSARNamespaceAccessTestConfig(t, server.URL, "list", "pods"))
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.Equal(t, []string{"visible"}, listedNamespaces(t, rr.Body.Bytes()))
+
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+
+	assert.Empty(t, upstream.probeAuth, "no GET probes in ssar mode")
+	require.Len(t, upstream.ssarReviews, 3, "one review per listed namespace")
+
+	namespaces := make([]string, 0, len(upstream.ssarReviews))
+
+	for i, attrs := range upstream.ssarReviews {
+		assert.Equal(t, "Bearer "+nsAccessUserToken, upstream.ssarAuth[i], "reviews must use the user's token")
+		assert.Equal(t, "list", attrs.Verb)
+		assert.Equal(t, "pods", attrs.Resource)
+		assert.Empty(t, attrs.Group)
+
+		namespaces = append(namespaces, attrs.Namespace)
+	}
+
+	assert.ElementsMatch(t, []string{"visible", "hidden", "gone"}, namespaces)
+}
+
+// TestNamespaceAccessSSARFailsClosed checks that a review that cannot be
+// completed (e.g. the user may not create SelfSubjectAccessReviews, or the
+// API server fails) never returns an unfiltered list.
+func TestNamespaceAccessSSARFailsClosed(t *testing.T) {
+	for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			upstream := &nsAccessUpstream{
+				ssarAllowed: map[string]bool{"visible": true, "hidden": true, "gone": true},
+				ssarStatus:  status,
+			}
+			server := httptest.NewTLSServer(upstream.handler(t))
+			t.Cleanup(server.Close)
+
+			rr := serveNamespaceList(t, newSSARNamespaceAccessTestConfig(t, server.URL, "list", "pods"))
+
+			assert.Equal(t, http.StatusBadGateway, rr.Code)
+			assert.NotContains(t, rr.Body.String(), "hidden")
+		})
+	}
+}
+
+// TestNewNamespaceProbeFactoryDefaultsToGet checks that GET probes stay the
+// default.
+func TestNewNamespaceProbeFactoryDefaultsToGet(t *testing.T) {
+	upstream := &nsAccessUpstream{
+		getStatuses: map[string]int{"visible": 200, "hidden": 403, "gone": 404},
+		ssarAllowed: map[string]bool{"visible": true, "hidden": true, "gone": true},
+	}
+	server := httptest.NewTLSServer(upstream.handler(t))
+	t.Cleanup(server.Close)
+
+	c := newNamespaceAccessTestConfig(t, server.URL)
+	c.namespaceProbe = newNamespaceProbeFactory(&config.Config{NamespaceAccessCheck: config.NamespaceAccessCheckGet})
+
+	rr := serveNamespaceList(t, c)
+
+	require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
+	assert.Equal(t, []string{"visible"}, listedNamespaces(t, rr.Body.Bytes()))
+
+	upstream.mu.Lock()
+	defer upstream.mu.Unlock()
+
+	assert.Len(t, upstream.probeAuth, 3)
+	assert.Empty(t, upstream.ssarReviews, "no reviews in get mode")
 }

@@ -94,6 +94,9 @@ type HeadlampConfig struct {
 	oidcStateReader   io.Reader
 	// namespaceFilter is set when --require-namespace-get is enabled.
 	namespaceFilter *nsaccess.Filter
+	// namespaceProbe builds the namespace access checks of namespaceFilter;
+	// nil means GET probes.
+	namespaceProbe namespaceProbeFactory
 }
 
 func compileProxyURLPatterns(patterns []string) ([]glob.Glob, error) {

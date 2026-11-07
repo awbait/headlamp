@@ -1397,3 +1397,78 @@ func TestValidateAPIProxy(t *testing.T) {
 		})
 	}
 }
+
+// TestNamespaceAccessCheck verifies the namespace-access-* flag defaults and
+// their validation.
+func TestNamespaceAccessCheck(t *testing.T) {
+	t.Run("defaults", func(t *testing.T) {
+		conf, err := config.Parse([]string{"go run ./cmd"})
+		require.NoError(t, err)
+
+		assert.Equal(t, config.NamespaceAccessCheckGet, conf.NamespaceAccessCheck)
+		assert.Equal(t, "list", conf.NamespaceAccessSSARVerb)
+		assert.Equal(t, "pods", conf.NamespaceAccessSSARResource)
+		assert.Empty(t, conf.NamespaceAccessSSARGroup)
+	})
+
+	t.Run("ssar_with_custom_attributes", func(t *testing.T) {
+		conf, err := config.Parse([]string{
+			"go run ./cmd", "--require-namespace-get", "--namespace-access-check=ssar",
+			"--namespace-access-ssar-verb=get", "--namespace-access-ssar-resource=deployments",
+			"--namespace-access-ssar-group=apps",
+		})
+		require.NoError(t, err)
+
+		assert.Equal(t, config.NamespaceAccessCheckSSAR, conf.NamespaceAccessCheck)
+		assert.Equal(t, "get", conf.NamespaceAccessSSARVerb)
+		assert.Equal(t, "deployments", conf.NamespaceAccessSSARResource)
+		assert.Equal(t, "apps", conf.NamespaceAccessSSARGroup)
+	})
+
+	t.Run("ssar_from_env", func(t *testing.T) {
+		t.Setenv("HEADLAMP_CONFIG_REQUIRE_NAMESPACE_GET", "true")
+		t.Setenv("HEADLAMP_CONFIG_NAMESPACE_ACCESS_CHECK", "ssar")
+		t.Setenv("HEADLAMP_CONFIG_NAMESPACE_ACCESS_SSAR_RESOURCE", "services")
+
+		conf, err := config.Parse([]string{"go run ./cmd"})
+		require.NoError(t, err)
+
+		assert.Equal(t, config.NamespaceAccessCheckSSAR, conf.NamespaceAccessCheck)
+		assert.Equal(t, "services", conf.NamespaceAccessSSARResource)
+	})
+}
+
+// TestNamespaceAccessCheckValidation verifies that invalid namespace-access-*
+// combinations are rejected.
+func TestNamespaceAccessCheckValidation(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		args          []string
+		errorContains string
+	}{
+		{
+			name:          "unknown_check",
+			args:          []string{"--require-namespace-get", "--namespace-access-check=rbac"},
+			errorContains: "namespace-access-check must be",
+		},
+		{
+			name:          "ssar_without_require_namespace_get",
+			args:          []string{"--namespace-access-check=ssar"},
+			errorContains: "requires require-namespace-get",
+		},
+		{
+			name: "ssar_without_resource",
+			args: []string{
+				"--require-namespace-get", "--namespace-access-check=ssar", "--namespace-access-ssar-resource=",
+			},
+			errorContains: "namespace-access-ssar-resource",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			conf, err := config.Parse(append([]string{"go run ./cmd"}, tt.args...))
+			require.Error(t, err)
+			assert.Nil(t, conf)
+			assert.Contains(t, err.Error(), tt.errorContains)
+		})
+	}
+}

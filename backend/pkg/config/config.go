@@ -115,6 +115,14 @@ type Config struct {
 	// connection. Use only for testing.
 	OidcAPIProxySkipTLSVerify bool `koanf:"oidc-api-proxy-skip-tls-verify"`
 
+	// NamespaceAccessCheck selects how require-namespace-get decides whether
+	// the user can access a namespace: "get" (GET the namespace) or "ssar"
+	// (a SelfSubjectAccessReview for NamespaceAccessSSAR*).
+	NamespaceAccessCheck        string `koanf:"namespace-access-check"`
+	NamespaceAccessSSARVerb     string `koanf:"namespace-access-ssar-verb"`
+	NamespaceAccessSSARResource string `koanf:"namespace-access-ssar-resource"`
+	NamespaceAccessSSARGroup    string `koanf:"namespace-access-ssar-group"`
+
 	// telemetry configs
 	ServiceName        string   `koanf:"service-name"`
 	ServiceVersion     *string  `koanf:"service-version"`
@@ -244,6 +252,36 @@ func (c *Config) Validate() error {
 
 	if err := c.validateClusterInventory(); err != nil {
 		return err
+	}
+
+	return c.validateNamespaceAccess()
+}
+
+// Namespace access checks used by require-namespace-get.
+const (
+	NamespaceAccessCheckGet  = "get"
+	NamespaceAccessCheckSSAR = "ssar"
+)
+
+// validateNamespaceAccess validates the namespace-access-* options.
+func (c *Config) validateNamespaceAccess() error {
+	switch c.NamespaceAccessCheck {
+	case "", NamespaceAccessCheckGet:
+		return nil
+	case NamespaceAccessCheckSSAR:
+	default:
+		return fmt.Errorf("namespace-access-check must be %q or %q, got %q",
+			NamespaceAccessCheckGet, NamespaceAccessCheckSSAR, c.NamespaceAccessCheck)
+	}
+
+	if !c.RequireNamespaceGet {
+		return errors.New("namespace-access-check=ssar requires require-namespace-get to be enabled")
+	}
+
+	if strings.TrimSpace(c.NamespaceAccessSSARVerb) == "" ||
+		strings.TrimSpace(c.NamespaceAccessSSARResource) == "" {
+		return errors.New("namespace-access-check=ssar requires namespace-access-ssar-verb and " +
+			"namespace-access-ssar-resource to be set")
 	}
 
 	return nil
@@ -672,6 +710,15 @@ func addGeneralFlags(f *flag.FlagSet, appName string) {
 	f.Bool("dev", false, "Allow connections from other origins")
 	f.Bool("cache-enabled", false, "K8s cache in backend")
 	f.Bool("require-namespace-get", false, "Only show namespaces the user can GET, even if they can LIST all")
+	f.String("namespace-access-check", NamespaceAccessCheckGet,
+		"How require-namespace-get checks access to a namespace: "+
+			"\"get\" (GET the namespace) or \"ssar\" (SelfSubjectAccessReview, see namespace-access-ssar-*)")
+	f.String("namespace-access-ssar-verb", "list",
+		"Verb checked in each namespace when namespace-access-check is \"ssar\"")
+	f.String("namespace-access-ssar-resource", "pods",
+		"Resource checked in each namespace when namespace-access-check is \"ssar\"")
+	f.String("namespace-access-ssar-group", "",
+		"API group of namespace-access-ssar-resource (empty for the core group)")
 	f.Bool("no-browser", false, "Disable automatically opening the browser when using embedded frontend")
 	f.Bool("insecure-ssl", false, "Accept/Ignore all server SSL certificates")
 	f.String("log-level", "info", "Set backend log verbosity. Options: debug, info (default), warn, error")

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,14 +17,18 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/cache"
+	"github.com/kubernetes-sigs/headlamp/backend/pkg/config"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/kubeconfig"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/logger"
 	"github.com/kubernetes-sigs/headlamp/backend/pkg/nsaccess"
+	authorizationv1 "k8s.io/api/authorization/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 )
 
 const (
-	namespaceListAPIPath = "/api/v1/namespaces"
+	namespaceListAPIPath           = "/api/v1/namespaces"
+	selfSubjectAccessReviewAPIPath = "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"
 	// maxProbeBodyBytes bounds how much of a probe response is drained so
 	// the connection can be reused.
 	maxProbeBodyBytes = 64 << 10
@@ -63,6 +68,100 @@ func namespaceGetProbe(kContext *kubeconfig.Context, token string) nsaccess.Prob
 	}
 }
 
+// namespaceProbeFactory builds the Probe that checks namespace access for one
+// user of one cluster.
+type namespaceProbeFactory func(kContext *kubeconfig.Context, token string) nsaccess.Probe
+
+// newNamespaceProbeFactory returns the probe factory selected by the
+// namespace-access-* options.
+func newNamespaceProbeFactory(conf *config.Config) namespaceProbeFactory {
+	if conf.NamespaceAccessCheck != config.NamespaceAccessCheckSSAR {
+		return namespaceGetProbe
+	}
+
+	attrs := authorizationv1.ResourceAttributes{
+		Verb:     strings.TrimSpace(conf.NamespaceAccessSSARVerb),
+		Group:    strings.TrimSpace(conf.NamespaceAccessSSARGroup),
+		Resource: strings.TrimSpace(conf.NamespaceAccessSSARResource),
+	}
+
+	return func(kContext *kubeconfig.Context, token string) nsaccess.Probe {
+		return namespaceSSARProbe(kContext, token, attrs)
+	}
+}
+
+// namespaceProbeFor returns the Probe used for the user's namespace checks.
+func (c *HeadlampConfig) namespaceProbeFor(kContext *kubeconfig.Context, token string) nsaccess.Probe {
+	if c.namespaceProbe == nil {
+		return namespaceGetProbe(kContext, token)
+	}
+
+	return c.namespaceProbe(kContext, token)
+}
+
+// namespaceSSARProbe returns a Probe that asks the API server, with a
+// SelfSubjectAccessReview, whether the user may perform attrs (verb, group,
+// resource) in the namespace. Like the GET probe it goes through the
+// context's reverse proxy, so it takes the same route (kube-apiserver or API
+// proxy) as the user's own calls.
+//
+// Unlike a GET of the namespace object, this check is not satisfied by a
+// cluster-wide grant of "get namespaces", which platforms often hand out
+// together with "list namespaces" so that namespace selectors work.
+func namespaceSSARProbe(
+	kContext *kubeconfig.Context,
+	token string,
+	attrs authorizationv1.ResourceAttributes,
+) nsaccess.Probe {
+	return func(ctx context.Context, name string) (bool, error) {
+		reviewAttrs := attrs
+		reviewAttrs.Namespace = name
+
+		body, err := json.Marshal(authorizationv1.SelfSubjectAccessReview{
+			TypeMeta: metav1.TypeMeta{
+				APIVersion: authorizationv1.SchemeGroupVersion.String(),
+				Kind:       "SelfSubjectAccessReview",
+			},
+			Spec: authorizationv1.SelfSubjectAccessReviewSpec{ResourceAttributes: &reviewAttrs},
+		})
+		if err != nil {
+			return false, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, selfSubjectAccessReviewAPIPath,
+			bytes.NewReader(body))
+		if err != nil {
+			return false, err
+		}
+
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := kContext.ProxyRoundTrip(req)
+		if err != nil {
+			return false, err
+		}
+
+		defer func() { _ = resp.Body.Close() }()
+
+		limited := io.LimitReader(resp.Body, maxProbeBodyBytes)
+
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+			_, _ = io.Copy(io.Discard, limited)
+
+			return false, fmt.Errorf("unexpected status %d creating SelfSubjectAccessReview", resp.StatusCode)
+		}
+
+		var review authorizationv1.SelfSubjectAccessReview
+		if err := json.NewDecoder(limited).Decode(&review); err != nil {
+			return false, fmt.Errorf("decoding SelfSubjectAccessReview: %w", err)
+		}
+
+		return review.Status.Allowed, nil
+	}
+}
+
 // namespaceAccessToken returns the user's bearer token for the request, or an
 // empty string when the request is unauthenticated or served with the
 // service account token (in which case there is no per-user identity to
@@ -85,7 +184,7 @@ func (c *HeadlampConfig) namespaceEventFilter(
 	event []byte,
 ) (bool, error) {
 	return c.namespaceFilter.AllowEvent(ctx, nsaccess.UserKey(kContext.Name, token), event,
-		namespaceGetProbe(kContext, token))
+		c.namespaceProbeFor(kContext, token))
 }
 
 // RequireNamespaceGetMiddleware restricts namespace listings and namespace
@@ -160,7 +259,7 @@ func (c *HeadlampConfig) serveFilteredNamespaceList(
 
 	body, err := buffered.decodedBody()
 	if err == nil {
-		body, err = c.namespaceFilter.FilterList(r.Context(), userKey, body, namespaceGetProbe(kContext, token))
+		body, err = c.namespaceFilter.FilterList(r.Context(), userKey, body, c.namespaceProbeFor(kContext, token))
 	}
 
 	if err != nil {
@@ -302,7 +401,7 @@ func (c *HeadlampConfig) relayFilteredNamespaceWatch(
 	defer func() { _ = client.Close() }()
 
 	base64Frames := strings.Contains(upstream.Subprotocol(), "base64")
-	probe := namespaceGetProbe(kContext, token)
+	probe := c.namespaceProbeFor(kContext, token)
 
 	done := make(chan struct{}, 2)
 
