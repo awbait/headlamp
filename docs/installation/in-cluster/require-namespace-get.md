@@ -48,6 +48,48 @@ Decisions are cached per user token for 30 seconds, so the extra `GET`
 requests are only issued on the first listing and after the cache expires. Up
 to 8 checks run in parallel.
 
+## Checking access with a SelfSubjectAccessReview
+
+The `get` check only works when users cannot `get` namespaces cluster-wide.
+Many platforms grant `get` together with `list` on namespaces through a
+`ClusterRole`, so that namespace selectors work. Every `GET` then succeeds and
+nothing is filtered, even though the user can only work in the namespaces
+bound to them with `RoleBinding`s.
+
+For such setups, check access with a `SelfSubjectAccessReview` instead:
+
+- `-namespace-access-check=ssar` or env var `HEADLAMP_CONFIG_NAMESPACE_ACCESS_CHECK=ssar`
+
+A namespace is then shown only if the user may perform the configured verb on
+the configured resource **in that namespace**. By default this is `list pods`:
+
+| Flag | Env var | Default |
+| --- | --- | --- |
+| `-namespace-access-ssar-verb` | `HEADLAMP_CONFIG_NAMESPACE_ACCESS_SSAR_VERB` | `list` |
+| `-namespace-access-ssar-resource` | `HEADLAMP_CONFIG_NAMESPACE_ACCESS_SSAR_RESOURCE` | `pods` |
+| `-namespace-access-ssar-group` | `HEADLAMP_CONFIG_NAMESPACE_ACCESS_SSAR_GROUP` | empty (core group) |
+
+Pick a permission that every role meant to "see" a namespace has there, and
+that cluster-wide roles handed to everyone do not. With Helm:
+
+```yaml
+config:
+  extraArgs:
+    - -require-namespace-get=true
+    - -namespace-access-check=ssar
+    - -namespace-access-ssar-verb=list
+    - -namespace-access-ssar-resource=pods
+```
+
+The reviews are sent with the user's own token along the same route as the
+user's requests, including an [OIDC API proxy](./oidc-api-proxy.md), and are
+cached and run in parallel exactly like the `get` checks. Creating
+`SelfSubjectAccessReview`s is allowed for every authenticated user by the
+default `system:basic-user` ClusterRole. If a review cannot be completed, the
+listing fails closed as described below.
+
+`-namespace-access-check=ssar` requires `-require-namespace-get=true`.
+
 ## Safety
 
 - The filter fails closed. If any access check returns an unexpected error the
