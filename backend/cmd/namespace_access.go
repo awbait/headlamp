@@ -40,11 +40,11 @@ func newNamespaceFilter() *nsaccess.Filter {
 // on behalf of the user through the context's reverse proxy, so the request
 // takes the same route (kube-apiserver or API proxy) as the user's own calls.
 func namespaceGetProbe(kContext *kubeconfig.Context, token string) nsaccess.Probe {
-	return func(ctx context.Context, name string) (int, error) {
+	return func(ctx context.Context, name string) (bool, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 			namespaceListAPIPath+"/"+url.PathEscape(name), nil)
 		if err != nil {
-			return 0, err
+			return false, err
 		}
 
 		req.Header.Set("Accept", "application/json")
@@ -52,14 +52,14 @@ func namespaceGetProbe(kContext *kubeconfig.Context, token string) nsaccess.Prob
 
 		resp, err := kContext.ProxyRoundTrip(req)
 		if err != nil {
-			return 0, err
+			return false, err
 		}
 
 		defer func() { _ = resp.Body.Close() }()
 
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxProbeBodyBytes))
 
-		return resp.StatusCode, nil
+		return nsaccess.AllowedByGetStatus(resp.StatusCode)
 	}
 }
 

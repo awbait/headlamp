@@ -16,10 +16,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// statusProbe returns a Probe answering from a fixed status map and counting
-// the calls per namespace.
+// statusProbe returns a Probe answering like GET probes would for a fixed
+// status map, and counting the calls per namespace.
 func statusProbe(statuses map[string]int, calls *sync.Map) nsaccess.Probe {
-	return func(_ context.Context, name string) (int, error) {
+	return func(_ context.Context, name string) (bool, error) {
 		if calls != nil {
 			v, _ := calls.LoadOrStore(name, new(int32))
 			atomic.AddInt32(v.(*int32), 1) //nolint:forcetypeassert // the map only stores *int32
@@ -27,10 +27,10 @@ func statusProbe(statuses map[string]int, calls *sync.Map) nsaccess.Probe {
 
 		status, ok := statuses[name]
 		if !ok {
-			return 0, errors.New("boom")
+			return false, errors.New("boom")
 		}
 
-		return status, nil
+		return nsaccess.AllowedByGetStatus(status)
 	}
 }
 
@@ -128,7 +128,7 @@ func TestAllowedBoundsParallelism(t *testing.T) {
 
 		var inFlight, maxInFlight int32
 
-		probe := func(ctx context.Context, name string) (int, error) {
+		probe := func(ctx context.Context, name string) (bool, error) {
 			cur := atomic.AddInt32(&inFlight, 1)
 			defer atomic.AddInt32(&inFlight, -1)
 

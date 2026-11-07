@@ -1,13 +1,13 @@
 // Package nsaccess narrows the set of namespaces shown to a user down to the
-// namespaces the user is allowed to GET.
+// namespaces the user can access.
 //
 // Kubernetes RBAC cannot restrict the LIST verb to a subset of namespaces, so
 // multi-tenant platforms often grant LIST on namespaces cluster-wide while
 // per-namespace access is expressed through RoleBindings. In that setup a
 // plain namespace listing reveals every namespace in the cluster. Mirroring
-// Kiali's require_namespace_get feature flag, this package probes
-// GET /api/v1/namespaces/{name} with the user's own credentials for every
-// candidate namespace and keeps only the ones the user may GET.
+// Kiali's require_namespace_get feature flag, this package runs a Probe with
+// the user's own credentials for every candidate namespace (for example
+// GET /api/v1/namespaces/{name}) and keeps only the ones the probe allows.
 //
 // Decisions are cached per user (token hash) and namespace for a short
 // period so that repeated listings do not re-probe the cluster.
@@ -29,9 +29,9 @@ import (
 )
 
 const (
-	// DefaultCacheTTL is how long a GET decision is remembered per user.
+	// DefaultCacheTTL is how long an access decision is remembered per user.
 	DefaultCacheTTL = 30 * time.Second
-	// DefaultConcurrency bounds the number of GET probes running in
+	// DefaultConcurrency bounds the number of probes running in
 	// parallel for a single listing.
 	DefaultConcurrency = 8
 
@@ -42,9 +42,10 @@ const (
 	eventTypeError   = "ERROR"
 )
 
-// Probe performs GET /api/v1/namespaces/{name} with the user's credentials and
-// returns the HTTP status code of the response.
-type Probe func(ctx context.Context, name string) (int, error)
+// Probe reports whether the user may access the namespace with the given
+// name, checked with the user's own credentials. An error means the access
+// could not be determined; the filter then fails closed.
+type Probe func(ctx context.Context, name string) (bool, error)
 
 // Filter decides which namespaces a user may see.
 type Filter struct {
@@ -88,9 +89,9 @@ func IsWatchQuery(query url.Values) bool {
 	return v != "" && v != "0" && v != "false"
 }
 
-// Allowed returns the subset of names the user may GET. Any probe outcome
-// other than a clean allow (200) or deny (403/404) aborts the whole check so
-// that an unfiltered list is never returned by accident.
+// Allowed returns the subset of names the user may access. A probe error
+// aborts the whole check so that an unfiltered list is never returned by
+// accident.
 func (f *Filter) Allowed(ctx context.Context, userKey string, names []string, probe Probe) (map[string]bool, error) {
 	allowed := make(map[string]bool, len(names))
 
@@ -183,14 +184,9 @@ func (f *Filter) probeAll(ctx context.Context, userKey string, names []string, p
 }
 
 func (f *Filter) check(ctx context.Context, userKey, name string, probe Probe) (bool, error) {
-	status, err := probe(ctx, name)
+	ok, err := probe(ctx, name)
 	if err != nil {
 		return false, fmt.Errorf("checking access to namespace %q: %w", name, err)
-	}
-
-	ok, err := decide(name, status)
-	if err != nil {
-		return false, err
 	}
 
 	// A failed cache write only costs an extra probe next time.
@@ -212,14 +208,17 @@ func cacheKey(userKey, name string) string {
 	return userKey + keySeparator + name
 }
 
-func decide(name string, status int) (bool, error) {
+// AllowedByGetStatus maps the status of GET /api/v1/namespaces/{name} to an
+// access decision: 200 allows, 403 and 404 deny and anything else is an
+// error.
+func AllowedByGetStatus(status int) (bool, error) {
 	switch status {
 	case http.StatusOK:
 		return true, nil
 	case http.StatusForbidden, http.StatusNotFound:
 		return false, nil
 	default:
-		return false, fmt.Errorf("unexpected status %d checking access to namespace %q", status, name)
+		return false, fmt.Errorf("unexpected status %d", status)
 	}
 }
 
@@ -239,7 +238,7 @@ type watchEvent struct {
 }
 
 // FilterList rewrites a NamespaceList JSON document (or its Table form) so
-// that it only contains the namespaces the user may GET. Documents without an
+// that it only contains the namespaces the user may access. Documents without an
 // items/rows array are returned unchanged.
 func (f *Filter) FilterList(ctx context.Context, userKey string, body []byte, probe Probe) ([]byte, error) {
 	var doc map[string]json.RawMessage
@@ -295,7 +294,7 @@ func (f *Filter) FilterList(ctx context.Context, userKey string, body []byte, pr
 // AllowEvent reports whether a namespace watch event may be forwarded to the
 // user. Events that carry no namespace name (ERROR, BOOKMARK) are forwarded.
 // DELETED events are forwarded unless the namespace is known to be hidden,
-// because a GET on a deleted namespace can no longer succeed.
+// because an access check on a deleted namespace may no longer succeed.
 func (f *Filter) AllowEvent(ctx context.Context, userKey string, event []byte, probe Probe) (bool, error) {
 	var ev watchEvent
 	if err := json.Unmarshal(event, &ev); err != nil {
